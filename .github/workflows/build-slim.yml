@@ -30,6 +30,11 @@
 #    * Full IPv6 stack (odhcp6c, odhcpd-ipv6only, dnsmasq DHCPv6, luci-proto-ipv6)
 #    * WireGuard (kernel module -> ~0 runtime RAM)
 #    * Simplified Chinese UI
+#    * PON diagnostics (airoha-pon-debug / pon-debug + tcpdump / libpcap)
+#      NOTE: tcpdump can NOT be dropped while airoha-pon-debug is kept -
+#            its "DEPENDS := +tcpdump" becomes a Kconfig "select", which
+#            overrides any "# CONFIG_PACKAGE_tcpdump is not set". It is
+#            flash-only (never resident), so it costs no runtime RAM.
 #
 #  REMOVE  (each one is a single commented line in step "Create custom config"
 #           below - uncomment / re-comment to change your mind)
@@ -37,7 +42,7 @@
 #    * iStore       (app store; LuCI package-manager still available)
 #    * UPnP         (miniupnpd daemon)
 #    * OpenClash / PassWall v1
-#    * tcpdump, iperf3, conntrack, i2c-tools, dnstap, rclone webui
+#    * iperf3, conntrack, i2c-tools, dnstap, rclone webui
 #    * dnsmasq DNSSEC / authoritative / TFTP extras
 #
 #  Default LAN IP : 192.168.1.1
@@ -968,7 +973,7 @@ jobs:
 
           echo "=========================================="
           echo "XG-040G-MD SLIM - PRE-BUILD VERIFICATION"
-          echo "workflow revision: slim-r2 (2026-10-16)"
+          echo "workflow revision: slim-r4 (2026-10-16)"
           echo "=========================================="
           echo
 
@@ -1657,28 +1662,63 @@ jobs:
 
             echo "Auditing: $root"
 
+            FAILURES=()
+
+            # ==========================================================
+            # RULE: only assert on files SHIPPED BY PACKAGES.
+            #       OpenWrt generates /etc/config/network,
+            #       /etc/config/system, ... on FIRST BOOT (base-files'
+            #       /bin/config_generate via /lib/preinit/82_config_generate),
+            #       so they are NOT in the staging target-dir.
+            #       Asserting on them is a guaranteed false positive.
+            # ==========================================================
+
             echo "---------- must be PRESENT ----------"
 
-            # airoha-pond      -> /usr/sbin/airoha-pond  (+ /usr/bin/pondctl symlink)
-            # airoha-ponctl    -> /usr/sbin/ponctl
-            # luci-app-pon     -> /usr/share/luci/menu.d/luci-app-pon.json
+            # airoha-pond        -> /usr/sbin/airoha-pond (+ /usr/bin/pondctl)
+            # airoha-ponctl      -> /usr/sbin/ponctl + /etc/config/pon
+            # airoha-pon-debug   -> /usr/sbin/pon-debug
+            # luci-app-pon       -> /usr/libexec/airoha-pon-data
+            #                       /usr/libexec/pon-board-identity
+            #                       /usr/share/luci/menu.d/luci-app-pon.json
+            # tcpdump            -> /usr/sbin/tcpdump (kept for pon-debug)
             for path in \
               usr/sbin/airoha-pond \
               usr/sbin/ponctl \
+              usr/sbin/pon-debug \
+              usr/sbin/tcpdump \
               etc/init.d/airoha-pond \
               etc/init.d/pon \
               etc/config/pon \
-              etc/config/network \
-              usr/share/luci/menu.d/luci-app-pon.json \
               usr/libexec/airoha-pon-data \
+              usr/libexec/pon-board-identity \
+              usr/share/luci/menu.d/luci-app-pon.json \
+              usr/share/rpcd/acl.d/luci-app-pon.json \
               etc/init.d/dnsmasq \
               etc/init.d/odhcpd \
               etc/init.d/firewall
             do
-              test -e "$root/$path" \
-                || { echo "ERROR: missing /$path"; exit 1; }
+              if [ -e "$root/$path" ]; then
+                echo "OK   : /$path"
+              else
+                echo "FAIL : missing /$path"
+                FAILURES+=("missing /$path")
+              fi
+            done
 
-              echo "OK   : /$path"
+            echo "---------- generated at first boot (informational) ----------"
+
+            # NOT fatal: these may or may not be staged depending on how
+            # the image is assembled. Do NOT gate the build on them.
+            for path in \
+              bin/config_generate \
+              lib/preinit/82_config_generate
+            do
+              if [ -e "$root/$path" ]; then
+                echo "OK   : /$path"
+              else
+                echo "NOTE : /$path not in staging dir (informational only)"
+              fi
             done
 
             echo "---------- PassWall2 SingBox core ----------"
@@ -1688,36 +1728,44 @@ jobs:
             elif [ -x "$root/usr/bin/sing-box-tiny" ]; then
               echo "OK   : /usr/bin/sing-box-tiny"
             else
-              echo "ERROR: PassWall2 SingBox core not found."
-              exit 1
+              echo "FAIL : PassWall2 SingBox core not found."
+              FAILURES+=("PassWall2 SingBox core not found")
             fi
 
-            test -f "$root/usr/share/luci/menu.d/luci-app-passwall2.json" \
-              || { echo "ERROR: luci-app-passwall2 menu missing"; exit 1; }
-
-            echo "OK   : luci-app-passwall2 menu"
+            if [ -f "$root/usr/share/luci/menu.d/luci-app-passwall2.json" ]; then
+              echo "OK   : luci-app-passwall2 menu"
+            else
+              echo "FAIL : luci-app-passwall2 menu missing"
+              FAILURES+=("luci-app-passwall2 menu missing")
+            fi
 
             echo "---------- LuCI PON view ----------"
 
-            find "$root/www/luci-static/resources/view/pon" \
-              -type f -print -quit 2>/dev/null | grep -q . \
-              || { echo "ERROR: LuCI PON views missing."; exit 1; }
-
-            echo "OK   : LuCI PON views present"
+            if find "$root/www/luci-static/resources/view/pon" \
+                 -type f -print -quit 2>/dev/null | grep -q .; then
+              echo "OK   : LuCI PON views present"
+            else
+              echo "FAIL : LuCI PON views missing."
+              FAILURES+=("LuCI PON views missing")
+            fi
 
             echo "---------- must be ABSENT ----------"
 
+            # tcpdump is intentionally NOT in this list: airoha-pon-debug
+            # DEPENDS := +tcpdump, so Kconfig's "select" always pulls it in.
             for path in \
               usr/sbin/smbd \
               usr/sbin/nmbd \
               usr/sbin/miniupnpd \
-              usr/sbin/tcpdump
+              etc/init.d/openclash \
+              etc/init.d/samba
             do
               if [ -e "$root/$path" ]; then
-                echo "ERROR: $path should not be in the image."
-                exit 1
+                echo "FAIL : /$path should not be in the image."
+                FAILURES+=("unexpected /$path")
+              else
+                echo "OK (absent): /$path"
               fi
-              echo "OK (absent): /$path"
             done
 
             echo "---------- installed package count ----------"
@@ -1733,6 +1781,19 @@ jobs:
             echo "---------- rootfs size ----------"
 
             du -sh "$root" || true
+
+            if [ "${#FAILURES[@]}" -gt 0 ]; then
+              echo ""
+              echo "=========================================="
+              echo "ROOTFS CONTENT AUDIT FAILED: ${#FAILURES[@]} problem(s)"
+              echo "=========================================="
+              printf '  - %s\n' "${FAILURES[@]}"
+              echo ""
+              echo "NOTE: this audit only asserts on files SHIPPED BY PACKAGES."
+              echo "      Files generated on first boot (/etc/config/network,"
+              echo "      /etc/config/system, ...) are never staged here."
+              exit 1
+            fi
 
             ok=1
             break
@@ -1778,33 +1839,56 @@ jobs:
           echo "========== Generic manifest =========="
           echo "$manifest"
 
+          FAILURES=()
+
           require_manifest_package()
           {
             local pkg="$1"
 
-            if ! grep -q "^${pkg} " "$manifest"; then
-              echo "ERROR: generic firmware manifest missing:"
-              echo "$pkg"
-              exit 1
+            if grep -q "^${pkg} " "$manifest"; then
+              echo "OK      : $pkg"
+            else
+              echo "FAIL    : missing $pkg"
+              FAILURES+=("manifest missing: $pkg")
             fi
-
-            echo "OK: $pkg"
           }
+
+          require_manifest_absent()
+          {
+            local pkg="$1"
+
+            if grep -q "^${pkg} " "$manifest"; then
+              echo "FAIL    : still present $pkg"
+              FAILURES+=("manifest still has: $pkg")
+            else
+              echo "OK      : $pkg absent"
+            fi
+          }
+
+          echo "---------- must be IN the image ----------"
 
           for pkg in \
             airoha-en7581-npu-firmware \
             kmod-nf-conntrack-bridge \
             kmod-nf-flow \
             kmod-nft-offload \
+            kmod-nft-nat \
             kmod-wireguard \
             wireguard-tools \
             luci-proto-wireguard \
             luci-app-passwall2 \
+            luci-i18n-passwall2-zh-cn \
             sing-box \
             chinadns-ng \
+            firewall4 \
+            nftables-json \
             luci-app-pon \
+            luci-i18n-pon-zh-cn \
             airoha-ponctl \
             airoha-pond \
+            airoha-pon-debug \
+            tcpdump \
+            libpcap \
             odhcp6c \
             odhcpd-ipv6only \
             luci-proto-ipv6
@@ -1812,6 +1896,10 @@ jobs:
             require_manifest_package "$pkg"
           done
 
+          echo "---------- must NOT be in the image ----------"
+
+          # tcpdump is deliberately NOT here: airoha-pon-debug
+          # DEPENDS := +tcpdump, so Kconfig always pulls it back in.
           for pkg in \
             luci-app-openclash \
             luci-app-passwall \
@@ -1819,14 +1907,20 @@ jobs:
             luci-app-samba4 \
             luci-app-store \
             luci-app-upnp \
-            tcpdump
+            ksmbd-server \
+            ksmbd-utils
           do
-            if grep -q "^${pkg} " "$manifest"; then
-              echo "ERROR: removed package still present: $pkg"
-              exit 1
-            fi
-            echo "OK (absent): $pkg"
+            require_manifest_absent "$pkg"
           done
+
+          if [ "${#FAILURES[@]}" -gt 0 ]; then
+            echo ""
+            echo "=========================================="
+            echo "GENERIC SOFTWARE MANIFEST FAILED: ${#FAILURES[@]} problem(s)"
+            echo "=========================================="
+            printf '  - %s\n' "${FAILURES[@]}"
+            exit 1
+          fi
 
           echo "========== Manifest package count =========="
           wc -l < "$manifest"
@@ -2025,6 +2119,7 @@ jobs:
           IPv6 (odhcp6c / odhcpd-ipv6only / DHCPv6 / luci-proto-ipv6)
           WireGuard
           Simplified Chinese UI
+          PON diagnostics (airoha-pon-debug + tcpdump / libpcap)
 
           Removed:
           Samba4 / ksmbd
@@ -2032,7 +2127,7 @@ jobs:
           UPnP
           OpenClash
           PassWall v1
-          tcpdump / iperf3 / conntrack / i2c-tools / dnstap / rclone webui
+          iperf3 / conntrack / i2c-tools / dnstap / rclone webui
           dnsmasq DNSSEC / authoritative / TFTP extras
 
           Installed packages: ${pkg_count}
@@ -2095,7 +2190,29 @@ jobs:
           echo "Target:  Nokia XG-040G-MD UBI only"
           echo "LAN IP:  192.168.1.1"
           echo "Kept:    PassWall2+SingBox / LuCI PON / IPv6 / WireGuard"
-          echo "Removed: Samba4 / iStore / UPnP / OpenClash / diagnostics"
+          echo "Kept:    PON diagnostics (airoha-pon-debug / tcpdump)"
+          echo "Removed: Samba4 / iStore / UPnP / OpenClash / iperf3 / dnstap"
           echo "Firmware:"
           echo "$asset_name"
           echo "=========================================="
+
+      # ============================================================
+      # 26. SAFETY NET
+      #
+      #     Runs ALWAYS (even when a step above failed), so a
+      #     ~2-hour build is never lost just because one of the
+      #     post-build audits tripped. The already-compiled .itb
+      #     stays downloadable from the run's Artifacts section.
+      # ============================================================
+
+      - name: Upload built firmware as artifact (safety net)
+        if: always() && !inputs.config_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: xg040gmd-slim-firmware
+          path: |
+            bin/targets/airoha/an7581/*sysupgrade.itb
+            bin/targets/airoha/an7581/*.manifest
+            bin/targets/airoha/an7581/sha256sums
+          if-no-files-found: warn
+          retention-days: 14
