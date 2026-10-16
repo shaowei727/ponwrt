@@ -798,10 +798,19 @@ jobs:
           # DROP : diagnostics & unused extras (flash only, no daemon)
           #        NOTE: ubi-utils / nand-utils / mtd / uboot-envtools
           #        are intentionally KEPT - sysupgrade needs them.
+          #
+          #        tcpdump / libpcap are deliberately NOT dropped:
+          #          airoha-pon-debug DEPENDS := +tcpdump ...
+          #        and OpenWrt compiles that "+" into a Kconfig
+          #        "select", which would silently re-enable tcpdump
+          #        anyway. Keeping them explicit means `pon-debug`
+          #        still works for PON field debugging. Neither one
+          #        ever stays resident, so runtime RAM is unaffected.
           # ========================================================
 
-          # CONFIG_PACKAGE_tcpdump is not set
-          # CONFIG_PACKAGE_libpcap is not set
+          CONFIG_PACKAGE_tcpdump=y
+          CONFIG_PACKAGE_libpcap=y
+          CONFIG_PACKAGE_airoha-pon-debug=y
           # CONFIG_PACKAGE_iperf3 is not set
           # CONFIG_PACKAGE_libiperf3 is not set
           # CONFIG_PACKAGE_conntrack is not set
@@ -911,7 +920,11 @@ jobs:
             -E '^(CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y|# CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.* is not set)$' \
             .config || true
 
-          make defconfig
+          # Keep the complete kconfig output - it contains the
+          # "unmet direct dependencies" warnings that explain why a
+          # symbol we asked for ended up disabled. Stored next to
+          # .config so it can be uploaded as an artifact.
+          make defconfig 2>&1 | tee defconfig.log
 
           echo "=========================================="
           echo "FINAL ENABLED TARGET"
@@ -953,22 +966,51 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "=========================================="
+          echo "XG-040G-MD SLIM - PRE-BUILD VERIFICATION"
+          echo "workflow revision: slim-r2 (2026-10-16)"
+          echo "=========================================="
+          echo
+
+          # All checks are COLLECTED, not fatal-on-first-error, so that a
+          # single run reports every problem at once instead of one per
+          # 3-hour CI round-trip.
+          FAILURES=()
+
+          fail_check()
+          {
+            FAILURES+=("$1")
+          }
+
+          show_actual()
+          {
+            local sym="$1"
+
+            grep -m1 "^${sym}=" .config \
+              || grep -m1 "^# ${sym} is not set" .config \
+              || echo "(symbol absent from .config)"
+          }
+
           require_package_selected()
           {
             local pkg="$1"
 
-            if ! grep -Eq \
+            if grep -Eq \
               "^CONFIG_PACKAGE_${pkg}=(y|m)$" \
               .config; then
 
-              echo "ERROR: required package not selected:"
-              echo "$pkg"
-              exit 1
+              grep -E \
+                "^CONFIG_PACKAGE_${pkg}=(y|m)$" \
+                .config
+
+              return 0
             fi
 
-            grep -E \
-              "^CONFIG_PACKAGE_${pkg}=(y|m)$" \
-              .config
+            echo "FAIL: required package not selected: ${pkg}"
+            echo "      actual: $(show_actual "CONFIG_PACKAGE_${pkg}")"
+
+            fail_check \
+              "required package not selected: ${pkg} (actual: $(show_actual "CONFIG_PACKAGE_${pkg}"))"
           }
 
           require_package_absent()
@@ -979,12 +1021,32 @@ jobs:
               "^CONFIG_PACKAGE_${pkg}=y$" \
               .config; then
 
-              echo "ERROR: package should have been removed:"
-              echo "$pkg"
-              exit 1
+              echo "FAIL: package should have been removed: ${pkg}"
+
+              fail_check \
+                "package should have been removed: ${pkg}"
+
+              return 0
             fi
 
             echo "OK (removed): $pkg"
+          }
+
+          # Bare "CONFIG_X=y" assertion, collected instead of fatal.
+          require_y()
+          {
+            local sym="$1"
+
+            if grep -q "^${sym}=y$" .config; then
+              echo "  OK  ${sym}=y"
+              return 0
+            fi
+
+            echo "FAIL: expected ${sym}=y"
+            echo "      actual: $(show_actual "$sym")"
+
+            fail_check \
+              "expected ${sym}=y (actual: $(show_actual "$sym"))"
           }
 
           echo "=========================================="
@@ -1072,15 +1134,15 @@ jobs:
           echo "IPV6"
           echo "=========================================="
 
-          if ! grep -q '^CONFIG_IPV6=y$' .config; then
-            echo "CONFIG_IPV6 not in .config - checking target kernel config"
-            grep -rqE '^CONFIG_IPV6=y$' target/linux/airoha/an7581/config-* || {
-              echo "ERROR: IPv6 kernel support is missing."
-              exit 1
-            }
+          if grep -q '^CONFIG_IPV6=y$' .config; then
+            echo "OK: CONFIG_IPV6=y"
+          elif grep -rqE '^CONFIG_IPV6=y$' \
+            target/linux/airoha/an7581/config-*; then
+            echo "OK: IPv6 kernel support enabled (via target config)."
+          else
+            echo "FAIL: IPv6 kernel support is missing."
+            fail_check "IPv6 kernel support is missing"
           fi
-
-          echo "OK: IPv6 kernel support enabled."
 
           require_package_selected "luci-proto-ipv6"
           require_package_selected "odhcp6c"
@@ -1102,7 +1164,32 @@ jobs:
           require_package_absent "luci-app-samba4"
           require_package_absent "samba4-server"
           require_package_absent "luci-app-upnp"
-          require_package_absent "tcpdump"
+
+          # --------------------------------------------------------
+          # PON diagnostics - KEPT ON PURPOSE
+          #
+          #   airoha-pon-debug DEPENDS := +airoha-ponctl +airoha-pond
+          #                              +tcpdump +ip-full +ip-bridge
+          #                              +ethtool
+          #
+          # OpenWrt turns "DEPENDS := +tcpdump" into a Kconfig "select",
+          # which OVERRIDES any "# CONFIG_PACKAGE_tcpdump is not set"
+          # we could write. The only way to drop tcpdump is to also drop
+          # airoha-pon-debug - and `pon-debug` is the single most useful
+          # tool when an ONU misbehaves on a PON uplink.
+          #
+          # tcpdump / libpcap never stay resident, they are flash-only,
+          # so keeping them costs no runtime RAM.
+          # --------------------------------------------------------
+
+          echo "=========================================="
+          echo "PON DIAGNOSTICS (KEPT)"
+          echo "=========================================="
+
+          require_package_selected "airoha-pon-debug"
+          require_package_selected "tcpdump"
+          require_package_selected "libpcap"
+          require_package_selected "ip-bridge"
 
           # --------------------------------------------------------
           # WireGuard
@@ -1112,11 +1199,11 @@ jobs:
           echo "WIREGUARD"
           echo "=========================================="
 
-          grep '^CONFIG_PACKAGE_kmod-wireguard=y$' .config
-          grep '^CONFIG_PACKAGE_wireguard-tools=y$' .config
-          grep '^CONFIG_PACKAGE_luci-proto-wireguard=y$' .config
-          grep '^CONFIG_PACKAGE_luci-lib-uqr=y$' .config
-          grep '^CONFIG_PACKAGE_resolveip=y$' .config
+          require_y "CONFIG_PACKAGE_kmod-wireguard"
+          require_y "CONFIG_PACKAGE_wireguard-tools"
+          require_y "CONFIG_PACKAGE_luci-proto-wireguard"
+          require_y "CONFIG_PACKAGE_luci-lib-uqr"
+          require_y "CONFIG_PACKAGE_resolveip"
 
           # --------------------------------------------------------
           # PassWall2
@@ -1126,18 +1213,11 @@ jobs:
           echo "PASSWALL2"
           echo "=========================================="
 
-          grep '^CONFIG_PACKAGE_luci-app-passwall2=y$' .config
-          grep '^CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=y$' .config
-
-          grep \
-            '^CONFIG_PACKAGE_luci-app-passwall2_Basic_Core_SingBox=y$' \
-            .config
-
-          grep '^CONFIG_PACKAGE_sing-box=y$' .config
-
-          grep \
-            '^CONFIG_PACKAGE_luci-app-passwall2_Nftables_Transparent_Proxy=y$' \
-            .config
+          require_y "CONFIG_PACKAGE_luci-app-passwall2"
+          require_y "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn"
+          require_y "CONFIG_PACKAGE_luci-app-passwall2_Basic_Core_SingBox"
+          require_y "CONFIG_PACKAGE_sing-box"
+          require_y "CONFIG_PACKAGE_luci-app-passwall2_Nftables_Transparent_Proxy"
 
           for option in \
             CONFIG_PACKAGE_luci-app-passwall2_Basic_Core_Xray \
@@ -1152,9 +1232,8 @@ jobs:
             CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Plugin
           do
             if grep -q "^${option}=y$" .config; then
-              echo "ERROR: unexpected PassWall2 option:"
-              echo "$option"
-              exit 1
+              echo "FAIL: unexpected PassWall2 option: ${option}"
+              fail_check "unexpected PassWall2 option: ${option}"
             fi
           done
 
@@ -1188,17 +1267,14 @@ jobs:
           echo "FIREWALL4 / NFTABLES"
           echo "=========================================="
 
-          grep '^CONFIG_PACKAGE_firewall4=y$' .config
-          grep '^CONFIG_PACKAGE_chinadns-ng=y$' .config
-
-          grep '^CONFIG_PACKAGE_dnsmasq-full=y$' .config
-          grep '^CONFIG_PACKAGE_dnsmasq_full_nftset=y$' .config
-
-          grep '^CONFIG_PACKAGE_nftables-json=y$' .config
-
-          grep '^CONFIG_PACKAGE_kmod-nft-socket=y$' .config
-          grep '^CONFIG_PACKAGE_kmod-nft-tproxy=y$' .config
-          grep '^CONFIG_PACKAGE_kmod-nft-nat=y$' .config
+          require_y "CONFIG_PACKAGE_firewall4"
+          require_y "CONFIG_PACKAGE_chinadns-ng"
+          require_y "CONFIG_PACKAGE_dnsmasq-full"
+          require_y "CONFIG_PACKAGE_dnsmasq_full_nftset"
+          require_y "CONFIG_PACKAGE_nftables-json"
+          require_y "CONFIG_PACKAGE_kmod-nft-socket"
+          require_y "CONFIG_PACKAGE_kmod-nft-tproxy"
+          require_y "CONFIG_PACKAGE_kmod-nft-nat"
 
           # --------------------------------------------------------
           # PON UI
@@ -1208,11 +1284,10 @@ jobs:
           echo "PON SOFTWARE"
           echo "=========================================="
 
-          grep '^CONFIG_PACKAGE_airoha-ponctl=y$' .config
-          grep '^CONFIG_PACKAGE_airoha-pond=y$' .config
-
-          grep '^CONFIG_PACKAGE_luci-app-pon=y$' .config
-          grep '^CONFIG_PACKAGE_luci-i18n-pon-zh-cn=y$' .config
+          require_y "CONFIG_PACKAGE_airoha-ponctl"
+          require_y "CONFIG_PACKAGE_airoha-pond"
+          require_y "CONFIG_PACKAGE_luci-app-pon"
+          require_y "CONFIG_PACKAGE_luci-i18n-pon-zh-cn"
 
           # --------------------------------------------------------
           # Chinese
@@ -1222,11 +1297,10 @@ jobs:
           echo "SIMPLIFIED CHINESE"
           echo "=========================================="
 
-          grep '^CONFIG_LUCI_LANG_zh_Hans=y$' .config
-
-          grep '^CONFIG_PACKAGE_luci-i18n-base-zh-cn=y$' .config
-          grep '^CONFIG_PACKAGE_luci-i18n-pon-zh-cn=y$' .config
-          grep '^CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=y$' .config
+          require_y "CONFIG_LUCI_LANG_zh_Hans"
+          require_y "CONFIG_PACKAGE_luci-i18n-base-zh-cn"
+          require_y "CONFIG_PACKAGE_luci-i18n-pon-zh-cn"
+          require_y "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn"
 
           # --------------------------------------------------------
           # IP / hostname
@@ -1236,13 +1310,53 @@ jobs:
           echo "DEFAULT IP / HOSTNAME"
           echo "=========================================="
 
-          grep -F \
+          if grep -qF \
             'lan) ipad=${ipaddr:-"192.168.1.1"} ;;' \
-            package/base-files/files/bin/config_generate
+            package/base-files/files/bin/config_generate; then
 
-          grep -F \
+            echo "OK: default LAN IP = 192.168.1.1"
+          else
+            echo "FAIL: default LAN IP not applied."
+            fail_check "default LAN IP not applied (config_generate)"
+          fi
+
+          if grep -qF \
             "set system.@system[-1].hostname='ImmortalWrt'" \
-            package/base-files/files/bin/config_generate
+            package/base-files/files/bin/config_generate; then
+
+            echo "OK: hostname = ImmortalWrt"
+          else
+            echo "FAIL: hostname not applied."
+            fail_check "hostname not applied (config_generate)"
+          fi
+
+          # --------------------------------------------------------
+          # Summary - report every failure at once
+          # --------------------------------------------------------
+
+          if [ "${#FAILURES[@]}" -ne 0 ]; then
+            echo
+            echo "=========================================="
+            echo "PRE-BUILD CHECK FAILED"
+            echo "=========================================="
+
+            printf '  - %s\n' "${FAILURES[@]}"
+
+            echo
+            echo "Total failures: ${#FAILURES[@]}"
+            echo
+            echo "=========================================="
+            echo "RELEVANT .config LINES (diagnostic dump)"
+            echo "=========================================="
+
+            grep -E \
+              '^(# )?CONFIG_(IPV6|LUCI_LANG|TARGET_PREINIT_IP)|^(# )?CONFIG_PACKAGE_(luci-app-passwall2|luci-i18n-passwall2|sing-box|chinadns-ng|dnsmasq|nftables|kmod-nft-|tcpdump|libpcap|ip-bridge|ethtool|airoha|luci-app-pon|luci-i18n-pon|coreutils|curl|ip-full|libuci-lua|lua|luci-compat|luci-lib-jsonc|lyaml|resolveip|tcping|geoview|v2ray-|unzip)' \
+              .config \
+              | sort \
+              || true
+
+            exit 1
+          fi
 
           echo "=========================================="
           echo "ALL PRE-BUILD CHECKS PASSED"
@@ -1252,12 +1366,59 @@ jobs:
       # 16. Config-only mode
       # ============================================================
 
+      - name: Dump configuration diagnostics
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "CONFIG DIAGNOSTICS (always runs)"
+          echo "=========================================="
+
+          if [ ! -f .config ]; then
+            echo "(.config was never generated)"
+            exit 0
+          fi
+
+          echo "---------- PassWall2 / proxy chain ----------"
+          grep -E \
+            '^(# )?CONFIG_PACKAGE_(luci-app-passwall2|luci-i18n-passwall2|sing-box|chinadns-ng|tcping|geoview|v2ray-|resolveip|lyaml|lua|luci-compat|luci-lib-jsonc|libuci-lua|unzip|coreutils|curl|ip-full)' \
+            .config | sort || true
+
+          echo "---------- firewall / nftables / dnsmasq ----------"
+          grep -E \
+            '^(# )?CONFIG_PACKAGE_(firewall4|nftables|kmod-nft|dnsmasq)' \
+            .config | sort || true
+
+          echo "---------- PON ----------"
+          grep -E \
+            '^(# )?CONFIG_PACKAGE_(airoha|luci-app-pon|luci-i18n-pon|tcpdump|libpcap|ip-bridge|ethtool)' \
+            .config | sort || true
+
+          echo "---------- IPv6 / language / preinit ----------"
+          grep -E '^CONFIG_(IPV6|LUCI_LANG|TARGET_PREINIT_IP)' .config | sort || true
+
+          echo "---------- device targets ----------"
+          grep -E '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_' .config \
+            | sort || true
+
+          echo "---------- kconfig warnings (from defconfig) ----------"
+          if [ -f defconfig.log ]; then
+            grep -iE 'warning|unmet|error' defconfig.log | head -n 40 || true
+          else
+            echo "(no defconfig.log)"
+          fi
+
+          echo "---------- END DIAGNOSTICS ----------"
+
       - name: Upload build config
-        if: ${{ inputs.config_only }}
+        if: ${{ always() && inputs.config_only }}
         uses: actions/upload-artifact@v4
         with:
           name: xg040gmd-slim-build-config
-          path: .config
+          path: |
+            .config
+            defconfig.log
+          if-no-files-found: warn
           include-hidden-files: true
           retention-days: 7
 
